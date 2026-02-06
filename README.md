@@ -1,10 +1,8 @@
 # AutomateWoo CLI
 
-Run AutomateWoo manual workflows from the command line - fast.
+Run AutomateWoo manual workflows from the command line.
 
-## Why?
-
-The AutomateWoo admin UI can take hours to match and queue thousands of subscriptions or orders. This CLI tool bypasses the REST API and JavaScript overhead, processing items directly in PHP.
+This CLI tool bypasses the REST API and JavaScript overhead, processing items directly in PHP.
 
 ## Requirements
 
@@ -110,7 +108,3 @@ Use `--debug` to see memory usage during processing.
 **No workflows listed**: The `list` command only shows manual workflows. Check that your workflows use the "Manual - Subscriptions" or "Manual - Orders" trigger.
 
 **Memory issues**: Try reducing batch size: `--batch-size=100`
-
-## License
-
-GPL-2.0+

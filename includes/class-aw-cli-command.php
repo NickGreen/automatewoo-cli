@@ -43,6 +43,27 @@ class AW_CLI_Command extends WP_CLI_Command {
 	const DEFAULT_BATCH_SIZE = 500;
 
 	/**
+	 * Maximum allowed batch size.
+	 *
+	 * @var int
+	 */
+	const MAX_BATCH_SIZE = 10000;
+
+	/**
+	 * Interval for memory cleanup operations.
+	 *
+	 * @var int
+	 */
+	const MEMORY_CLEANUP_INTERVAL = 500;
+
+	/**
+	 * Cached HPOS detection result.
+	 *
+	 * @var bool|null
+	 */
+	private ?bool $is_using_hpos_cache = null;
+
+	/**
 	 * Run a manual workflow.
 	 *
 	 * Scans items (orders/subscriptions) matching the workflow rules,
@@ -67,12 +88,23 @@ class AW_CLI_Command extends WP_CLI_Command {
 	 * @param array $args       Positional arguments.
 	 * @param array $assoc_args Associative arguments.
 	 */
-	public function run( $args, $assoc_args ) {
+	public function run( array $args, array $assoc_args ): void {
 		set_time_limit( 0 );
 		wp_raise_memory_limit( 'admin' );
 
+		if ( empty( $args[0] ) ) {
+			WP_CLI::error( 'Workflow ID is required.' );
+		}
+
 		$workflow_id = (int) $args[0];
-		$batch_size  = (int) ( $assoc_args['batch-size'] ?? self::DEFAULT_BATCH_SIZE );
+		if ( $workflow_id < 1 ) {
+			WP_CLI::error( 'Workflow ID must be a positive integer.' );
+		}
+
+		$batch_size = (int) ( $assoc_args['batch-size'] ?? self::DEFAULT_BATCH_SIZE );
+		if ( $batch_size < 1 || $batch_size > self::MAX_BATCH_SIZE ) {
+			WP_CLI::error( sprintf( 'Batch size must be between 1 and %d.', self::MAX_BATCH_SIZE ) );
+		}
 
 		$workflow = Factory::get( $workflow_id );
 
@@ -91,7 +123,7 @@ class AW_CLI_Command extends WP_CLI_Command {
 		}
 
 		$data_type      = $trigger->get_primary_data_type();
-		$data_type_name = $data_type === 'subscription' ? 'subscriptions' : 'orders';
+		$data_type_name = $this->get_data_type_name( $data_type );
 
 		$this->display_workflow_header( $workflow );
 		$this->display_workflow_details( $workflow, $trigger );
@@ -103,7 +135,7 @@ class AW_CLI_Command extends WP_CLI_Command {
 		WP_CLI::log( str_repeat( "\u{2500}", 63 ) );
 		WP_CLI::log( '' );
 
-		if ( $total_on_site === 0 ) {
+		if ( 0 === $total_on_site ) {
 			WP_CLI::warning( "No {$data_type_name} found on this site." );
 			return;
 		}
@@ -127,7 +159,7 @@ class AW_CLI_Command extends WP_CLI_Command {
 		WP_CLI::log( '' );
 		WP_CLI::log( WP_CLI::colorize( "%GFound {$match_count} matching {$data_type_name}.%n" ) );
 
-		if ( $match_count === 0 ) {
+		if ( 0 === $match_count ) {
 			WP_CLI::warning( "No {$data_type_name} matched the workflow rules." );
 			return;
 		}
@@ -138,10 +170,19 @@ class AW_CLI_Command extends WP_CLI_Command {
 		WP_CLI::log( '' );
 		WP_CLI::log( "Adding {$match_count} {$data_type_name} to the queue..." );
 
-		$queued_count = $this->queue_items( $workflow, $trigger, $matched_ids );
+		$result = $this->queue_items( $workflow, $trigger, $matched_ids );
 
 		WP_CLI::log( '' );
-		WP_CLI::success( "{$queued_count} {$data_type_name} were added to the queue." );
+
+		if ( $result['failed'] > 0 ) {
+			WP_CLI::warning( "{$result['failed']} {$data_type_name} failed to queue." );
+		}
+
+		if ( $result['queued'] > 0 ) {
+			WP_CLI::success( "{$result['queued']} {$data_type_name} were added to the queue." );
+		} else {
+			WP_CLI::error( 'No items were queued successfully.' );
+		}
 	}
 
 	/**
@@ -168,27 +209,29 @@ class AW_CLI_Command extends WP_CLI_Command {
 	 * @param array $args       Positional arguments.
 	 * @param array $assoc_args Associative arguments.
 	 */
-	public function list( $args, $assoc_args ) {
+	public function list( array $args, array $assoc_args ): void {
 		$format = $assoc_args['format'] ?? 'table';
 
-		$workflows = get_posts( [
-			'post_type'      => 'aw_workflow',
-			'post_status'    => [ 'publish', 'aw-disabled' ],
-			'posts_per_page' => -1,
-			'meta_query'     => [
-				[
-					'key'   => 'type',
-					'value' => 'manual',
-				],
-			],
-		] );
+		$workflows = get_posts(
+			array(
+				'post_type'      => 'aw_workflow',
+				'post_status'    => array( 'publish', 'aw-disabled' ),
+				'posts_per_page' => -1,
+				'meta_query'     => array(
+					array(
+						'key'   => 'type',
+						'value' => 'manual',
+					),
+				),
+			)
+		);
 
 		if ( empty( $workflows ) ) {
 			WP_CLI::warning( 'No manual workflows found.' );
 			return;
 		}
 
-		$items = [];
+		$items = array();
 		foreach ( $workflows as $post ) {
 			$workflow = Factory::get( $post->ID );
 			if ( ! $workflow ) {
@@ -198,17 +241,17 @@ class AW_CLI_Command extends WP_CLI_Command {
 			$trigger   = $workflow->get_trigger();
 			$data_type = $trigger instanceof ManualInterface ? $trigger->get_primary_data_type() : 'unknown';
 
-			$status = $post->post_status === 'publish' ? 'Active' : 'Disabled';
+			$status = 'publish' === $post->post_status ? 'Active' : 'Disabled';
 
-			$items[] = [
+			$items[] = array(
 				'ID'        => $workflow->get_id(),
 				'Title'     => $workflow->title,
 				'Data Type' => ucfirst( $data_type ),
 				'Status'    => $status,
-			];
+			);
 		}
 
-		WP_CLI\Utils\format_items( $format, $items, [ 'ID', 'Title', 'Data Type', 'Status' ] );
+		WP_CLI\Utils\format_items( $format, $items, array( 'ID', 'Title', 'Data Type', 'Status' ) );
 	}
 
 	/**
@@ -226,9 +269,17 @@ class AW_CLI_Command extends WP_CLI_Command {
 	 * @param array $args       Positional arguments.
 	 * @param array $assoc_args Associative arguments.
 	 */
-	public function info( $args, $assoc_args ) {
+	public function info( array $args, array $assoc_args ): void {
+		if ( empty( $args[0] ) ) {
+			WP_CLI::error( 'Workflow ID is required.' );
+		}
+
 		$workflow_id = (int) $args[0];
-		$workflow    = Factory::get( $workflow_id );
+		if ( $workflow_id < 1 ) {
+			WP_CLI::error( 'Workflow ID must be a positive integer.' );
+		}
+
+		$workflow = Factory::get( $workflow_id );
 
 		if ( ! $workflow || ! $workflow->exists ) {
 			WP_CLI::error( "Workflow #{$workflow_id} not found." );
@@ -241,7 +292,7 @@ class AW_CLI_Command extends WP_CLI_Command {
 
 		if ( 'manual' === $workflow->get_type() && $trigger instanceof ManualInterface ) {
 			$data_type      = $trigger->get_primary_data_type();
-			$data_type_name = $data_type === 'subscription' ? 'subscriptions' : 'orders';
+			$data_type_name = $this->get_data_type_name( $data_type );
 			$total_on_site  = $this->get_total_items_count( $data_type );
 
 			WP_CLI::log( str_repeat( "\u{2500}", 63 ) );
@@ -251,11 +302,26 @@ class AW_CLI_Command extends WP_CLI_Command {
 	}
 
 	/**
+	 * Get the plural display name for a data type.
+	 *
+	 * @param string $data_type The data type ('subscription' or 'order').
+	 * @return string
+	 */
+	private function get_data_type_name( string $data_type ): string {
+		$names = array(
+			'subscription' => 'subscriptions',
+			'order'        => 'orders',
+		);
+
+		return $names[ $data_type ] ?? $data_type . 's';
+	}
+
+	/**
 	 * Display workflow header.
 	 *
 	 * @param Workflow $workflow The workflow.
 	 */
-	private function display_workflow_header( $workflow ) {
+	private function display_workflow_header( Workflow $workflow ): void {
 		WP_CLI::log( '' );
 		WP_CLI::log( str_repeat( "\u{2550}", 63 ) );
 		WP_CLI::log( WP_CLI::colorize( "%YWORKFLOW:%n {$workflow->title} (#{$workflow->get_id()})" ) );
@@ -266,10 +332,10 @@ class AW_CLI_Command extends WP_CLI_Command {
 	/**
 	 * Display workflow details (trigger, rules, actions, timing).
 	 *
-	 * @param Workflow $workflow The workflow.
-	 * @param mixed    $trigger  The trigger.
+	 * @param Workflow                            $workflow The workflow.
+	 * @param \AutomateWoo\Trigger|null           $trigger  The trigger.
 	 */
-	private function display_workflow_details( $workflow, $trigger ) {
+	private function display_workflow_details( Workflow $workflow, ?\AutomateWoo\Trigger $trigger ): void {
 		$trigger_title = $trigger ? $trigger->get_title() : 'Unknown';
 		WP_CLI::log( WP_CLI::colorize( "%BTRIGGER:%n {$trigger_title}" ) );
 		WP_CLI::log( '' );
@@ -299,7 +365,7 @@ class AW_CLI_Command extends WP_CLI_Command {
 			foreach ( $actions as $action ) {
 				$action_title = $action->get_title( true );
 				WP_CLI::log( '  ' . $action_num . ". {$action_title}" );
-				$action_num++;
+				++$action_num;
 			}
 			WP_CLI::log( '' );
 		} else {
@@ -307,7 +373,7 @@ class AW_CLI_Command extends WP_CLI_Command {
 			WP_CLI::log( '' );
 		}
 
-		$timing_type = $workflow->get_timing_type();
+		$timing_type    = $workflow->get_timing_type();
 		$timing_display = $this->format_timing_display( $workflow, $timing_type );
 		WP_CLI::log( WP_CLI::colorize( "%BTIMING:%n {$timing_display}" ) );
 		WP_CLI::log( '' );
@@ -316,10 +382,10 @@ class AW_CLI_Command extends WP_CLI_Command {
 	/**
 	 * Format a rule for display.
 	 *
-	 * @param array $rule The rule data.
+	 * @param array<string, mixed> $rule The rule data.
 	 * @return string
 	 */
-	private function format_rule_display( $rule ) {
+	private function format_rule_display( array $rule ): string {
 		$rule_name = $rule['name'] ?? '';
 		$compare   = $rule['compare'] ?? '';
 		$value     = $rule['value'] ?? '';
@@ -343,7 +409,7 @@ class AW_CLI_Command extends WP_CLI_Command {
 	 * @param string $compare The comparison type.
 	 * @return string
 	 */
-	private function format_rule_value( $value, $compare ) {
+	private function format_rule_value( mixed $value, string $compare ): string {
 		if ( ! is_array( $value ) ) {
 			return (string) $value;
 		}
@@ -352,23 +418,29 @@ class AW_CLI_Command extends WP_CLI_Command {
 			return $this->format_date_rule_value( $value, $compare );
 		}
 
-		if ( count( $value ) === 2 && isset( $value[0] ) && isset( $value[1] ) && is_string( $value[0] ) && strpos( $value[0], '_' ) === 0 ) {
+		if ( 2 === count( $value ) && isset( $value[0] ) && isset( $value[1] ) && is_string( $value[0] ) && 0 === strpos( $value[0], '_' ) ) {
 			return "{$value[0]} = {$value[1]}";
 		}
 
-		return implode( ', ', array_filter( $value, function( $v ) {
-			return $v !== '' && $v !== null;
-		} ) );
+		return implode(
+			', ',
+			array_filter(
+				$value,
+				function ( $v ) {
+					return '' !== $v && null !== $v;
+				}
+			)
+		);
 	}
 
 	/**
 	 * Format a date rule value for display.
 	 *
-	 * @param array  $value   The date rule value.
-	 * @param string $compare The comparison type.
+	 * @param array<string, mixed> $value   The date rule value.
+	 * @param string               $compare The comparison type.
 	 * @return string
 	 */
-	private function format_date_rule_value( $value, $compare ) {
+	private function format_date_rule_value( array $value, string $compare ): string {
 		$from      = $value['from'] ?? '';
 		$to        = $value['to'] ?? '';
 		$date      = $value['date'] ?? '';
@@ -398,9 +470,12 @@ class AW_CLI_Command extends WP_CLI_Command {
 				break;
 		}
 
-		$parts = array_filter( [ $date, $from, $to, $timeframe, $measure ], function( $v ) {
-			return $v !== '' && $v !== null;
-		} );
+		$parts = array_filter(
+			array( $date, $from, $to, $timeframe, $measure ),
+			function ( $v ) {
+				return '' !== $v && null !== $v;
+			}
+		);
 
 		return implode( ' ', $parts );
 	}
@@ -412,7 +487,7 @@ class AW_CLI_Command extends WP_CLI_Command {
 	 * @param string   $timing_type The timing type.
 	 * @return string
 	 */
-	private function format_timing_display( $workflow, $timing_type ) {
+	private function format_timing_display( Workflow $workflow, string $timing_type ): string {
 		switch ( $timing_type ) {
 			case 'immediately':
 				return 'Run immediately';
@@ -436,15 +511,21 @@ class AW_CLI_Command extends WP_CLI_Command {
 	/**
 	 * Find items matching the workflow rules.
 	 *
-	 * @param Workflow $workflow           The workflow.
-	 * @param mixed    $trigger            The trigger.
-	 * @param mixed    $quick_filter_query The quick filter query.
-	 * @param int      $batch_size         Batch size.
-	 * @param int      $total_to_scan      Total items to scan.
-	 * @return array Array of matched item IDs.
+	 * @param Workflow                                      $workflow           The workflow.
+	 * @param ManualInterface                               $trigger            The trigger.
+	 * @param \AutomateWoo\RuleQuickFilters\RuleQuickFilter $quick_filter_query The quick filter query.
+	 * @param int                                           $batch_size         Batch size.
+	 * @param int                                           $total_to_scan      Total items to scan.
+	 * @return array<int> Array of matched item IDs.
 	 */
-	private function find_matches( $workflow, $trigger, $quick_filter_query, $batch_size, $total_to_scan ) {
-		$matched_ids      = [];
+	private function find_matches(
+		Workflow $workflow,
+		ManualInterface $trigger,
+		\AutomateWoo\RuleQuickFilters\RuleQuickFilter $quick_filter_query,
+		int $batch_size,
+		int $total_to_scan
+	): array {
+		$matched_ids      = array();
 		$processed        = 0;
 		$rule_group_count = max( 1, count( $workflow->get_rule_data() ) );
 
@@ -470,7 +551,7 @@ class AW_CLI_Command extends WP_CLI_Command {
 
 					if ( isset( $matched_ids[ $item_id ] ) ) {
 						$progress->tick();
-						$processed++;
+						++$processed;
 						continue;
 					}
 
@@ -481,14 +562,14 @@ class AW_CLI_Command extends WP_CLI_Command {
 						if ( $workflow->validate_workflow() ) {
 							$matched_ids[ $item_id ] = true;
 						}
-
-						$workflow->cleanup();
 					} catch ( \Exception $e ) {
 						WP_CLI::debug( "Error validating item #{$item_id}: " . $e->getMessage() );
+					} finally {
+						$workflow->cleanup();
 					}
 
 					$progress->tick();
-					$processed++;
+					++$processed;
 				}
 
 				$offset += $batch_size;
@@ -505,13 +586,15 @@ class AW_CLI_Command extends WP_CLI_Command {
 	/**
 	 * Queue matched items for the workflow.
 	 *
-	 * @param Workflow $workflow    The workflow.
-	 * @param mixed    $trigger     The trigger.
-	 * @param array    $matched_ids Array of matched item IDs.
-	 * @return int Number of items queued.
+	 * @param Workflow        $workflow    The workflow.
+	 * @param ManualInterface $trigger     The trigger.
+	 * @param array<int>      $matched_ids Array of matched item IDs.
+	 * @return array{queued: int, failed: int} Number of items queued and failed.
 	 */
-	private function queue_items( $workflow, $trigger, $matched_ids ) {
+	private function queue_items( Workflow $workflow, ManualInterface $trigger, array $matched_ids ): array {
 		$queued_count = 0;
+		$failed_count = 0;
+		$processed    = 0;
 		$progress     = \WP_CLI\Utils\make_progress_bar( 'Queueing', count( $matched_ids ) );
 
 		foreach ( $matched_ids as $item_id ) {
@@ -534,22 +617,28 @@ class AW_CLI_Command extends WP_CLI_Command {
 					$queue->store_data_layer( $data_layer );
 				}
 
-				$workflow->cleanup();
-				$queued_count++;
+				++$queued_count;
 			} catch ( \Exception $e ) {
-				WP_CLI::debug( "Error queueing item #{$item_id}: " . $e->getMessage() );
+				++$failed_count;
+				WP_CLI::warning( "Failed to queue item #{$item_id}: " . $e->getMessage() );
+			} finally {
+				$workflow->cleanup();
 			}
 
 			$progress->tick();
+			++$processed;
 
-			if ( $queued_count % 500 === 0 ) {
-				$this->maybe_free_memory( $queued_count );
+			if ( 0 === $processed % self::MEMORY_CLEANUP_INTERVAL ) {
+				$this->maybe_free_memory( $processed );
 			}
 		}
 
 		$progress->finish();
 
-		return $queued_count;
+		return array(
+			'queued' => $queued_count,
+			'failed' => $failed_count,
+		);
 	}
 
 	/**
@@ -557,8 +646,8 @@ class AW_CLI_Command extends WP_CLI_Command {
 	 *
 	 * @param int $processed Number of items processed.
 	 */
-	private function maybe_free_memory( $processed ) {
-		if ( $processed % 500 !== 0 ) {
+	private function maybe_free_memory( int $processed ): void {
+		if ( 0 !== $processed % self::MEMORY_CLEANUP_INTERVAL ) {
 			return;
 		}
 
@@ -568,11 +657,13 @@ class AW_CLI_Command extends WP_CLI_Command {
 			gc_collect_cycles();
 		}
 
-		WP_CLI::debug( sprintf(
-			'Memory freed at %d items. Current usage: %s',
-			$processed,
-			size_format( memory_get_usage( true ) )
-		) );
+		WP_CLI::debug(
+			sprintf(
+				'Memory freed at %d items. Current usage: %s',
+				$processed,
+				size_format( memory_get_usage( true ) )
+			)
+		);
 	}
 
 	/**
@@ -581,32 +672,24 @@ class AW_CLI_Command extends WP_CLI_Command {
 	 * @param string $data_type The data type ('subscription' or 'order').
 	 * @return int
 	 */
-	private function get_total_items_count( $data_type ) {
+	private function get_total_items_count( string $data_type ): int {
 		global $wpdb;
 
-		if ( $data_type === 'subscription' ) {
-			if ( $this->is_using_hpos() ) {
-				return (int) $wpdb->get_var(
-					"SELECT COUNT(*) FROM {$wpdb->prefix}wc_orders WHERE type = 'shop_subscription'"
-				);
-			}
+		$order_type = 'subscription' === $data_type ? 'shop_subscription' : 'shop_order';
+
+		if ( $this->is_using_hpos() ) {
 			return (int) $wpdb->get_var(
 				$wpdb->prepare(
-					"SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = %s",
-					'shop_subscription'
+					"SELECT COUNT(*) FROM {$wpdb->prefix}wc_orders WHERE type = %s",
+					$order_type
 				)
 			);
 		}
 
-		if ( $this->is_using_hpos() ) {
-			return (int) $wpdb->get_var(
-				"SELECT COUNT(*) FROM {$wpdb->prefix}wc_orders WHERE type = 'shop_order'"
-			);
-		}
 		return (int) $wpdb->get_var(
 			$wpdb->prepare(
 				"SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = %s",
-				'shop_order'
+				$order_type
 			)
 		);
 	}
@@ -614,16 +697,35 @@ class AW_CLI_Command extends WP_CLI_Command {
 	/**
 	 * Check if WooCommerce is using HPOS (High Performance Order Storage).
 	 *
+	 * Uses WooCommerce's official API to check if custom orders table is enabled,
+	 * with a fallback to table existence check for older WooCommerce versions.
+	 *
 	 * @return bool
 	 */
-	private function is_using_hpos() {
+	private function is_using_hpos(): bool {
+		if ( null !== $this->is_using_hpos_cache ) {
+			return $this->is_using_hpos_cache;
+		}
+
+		// Use WooCommerce's official API if available.
+		if ( class_exists( 'Automattic\WooCommerce\Utilities\OrderUtil' ) ) {
+			$this->is_using_hpos_cache = \Automattic\WooCommerce\Utilities\OrderUtil::custom_orders_table_usage_is_enabled();
+			return $this->is_using_hpos_cache;
+		}
+
+		// Fallback for older WooCommerce versions: check if table exists and is being used.
 		global $wpdb;
 
-		$table_name = $wpdb->prefix . 'wc_orders';
+		$table_name   = $wpdb->prefix . 'wc_orders';
 		$table_exists = $wpdb->get_var(
 			$wpdb->prepare( 'SHOW TABLES LIKE %s', $table_name )
 		);
 
-		return ! empty( $table_exists );
+		// Table existence alone doesn't mean HPOS is enabled, default to false for safety.
+		$this->is_using_hpos_cache = false;
+
+		WP_CLI::debug( 'HPOS detection: OrderUtil class not available, defaulting to posts table.' );
+
+		return $this->is_using_hpos_cache;
 	}
 }
