@@ -1,18 +1,6 @@
 # AutomateWoo CLI
 
-Run AutomateWoo manual workflows from the command line.
-
-This CLI tool bypasses the REST API and JavaScript overhead, processing items directly in PHP.
-
-## Requirements
-
-- WordPress with WP-CLI
-- AutomateWoo plugin (active)
-
-## Installation
-
-1. Copy this plugin to `wp-content/plugins/automatewoo-cli/`
-2. Activate: `wp plugin activate automatewoo-cli`
+Run AutomateWoo manual workflows from the command line. The matching and adding to the queue is done in PHP from the CLI. The scheduled actions are still run from the queue as normal.
 
 ## Commands
 
